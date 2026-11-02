@@ -7,7 +7,7 @@ Background: `ollama pull` often aborts or jumps back in progress on unstable con
 5-second no-data limit and problems with the blob CDN (Cloudflare R2). Partial downloads are kept,
 so a restart resumes where it left off.
 
-- Single Python file, standard library only (Python 3.8+)
+- Single Python file, standard library only (Python 3.8+); `truststore` is optional (see certificate errors)
 - Windows, Linux, macOS
 
 ## Quick start
@@ -49,6 +49,9 @@ Permanent errors (model does not exist, HTTP 400/401/403/404) are not retried.
 | `--server-env K=V` | Additional environment variable for your own server (repeatable) |
 | `--proxy URL` | Start your own `ollama serve` using an HTTP(S) proxy |
 | `--diagnose` | Check DNS and reachability of the registry and blob CDN, then exit |
+| `--strict` | No automatic fallback to unverified TLS (`--direct`/`--diagnose`) |
+| `--insecure` | Disable TLS verification right away (see certificate errors) |
+| `--ca-bundle PEM` | Custom CA bundle for HTTPS (e.g. corporate CA); alternatively `SSL_CERT_FILE` |
 
 ## When a plain pull is not enough
 
@@ -103,11 +106,34 @@ Important: no other Ollama server may be running on the host (stop the service/t
 otherwise the script aborts with a message. The variables only affect the server started by the script.
 Whether `client2`/`MAXSTREAMS=1` helps varies per the issue thread: it works for some users, not for others.
 
+## Certificate errors ("unable to get local issuer certificate")
+
+Works without any setup: with `--direct` and `--diagnose` the script first checks whether the HTTPS connection to the
+registry works, and on a certificate error automatically tries, in order:
+
+1. Python default (including `truststore` if installed)
+2. System CA files (Debian/Ubuntu, RHEL/Fedora, openSUSE, Alpine, Homebrew)
+3. macOS keychain (certificates only via `security find-certificate`, no passwords or private keys; exported to a
+   temporary PEM file that is deleted on exit)
+4. Windows certificate store
+5. **Fallback without certificate verification** (with a clear warning) if none of them is accepted
+
+With the fallback active, integrity is still preserved: blobs are checked against the SHA256 from the manifest, and the
+subsequent `ollama pull` fetches the manifest over Ollama's own connection. A substituted manifest is harmless (its blobs
+would not be referenced by the real manifest). What remains: someone can see which models you download, and can feed you
+junk data.
+
+- `--strict`: no fallback; abort with a hint on certificate problems
+- `--ca-bundle file.pem` (or `SSL_CERT_FILE`): use your own CA, e.g. a corporate CA
+- `--insecure`: skip verification right away (without the search above)
+- If the error comes from `ollama pull` itself (Go: `x509: certificate signed by unknown authority`), the Ollama
+  **server** needs the CA, e.g. `--server-env SSL_CERT_FILE=/path/ca.pem` with a server started by the script.
+
 ## Miscellaneous
 
 - **A full disk** causes the same symptoms as network problems. The script warns if the local model
   directory has less free space than the download needs.
-- **Exit codes:** `0` all models downloaded, `1` at least one failed, `2` server start failed,
-  `130` interrupted with Ctrl+C.
+- **Exit codes:** `0` all models downloaded, `1` at least one failed (or `--strict` found no trusted certificate),
+  `2` server start failed, `130` interrupted with Ctrl+C.
 - Check raw line speed:
   `curl -L -C - -o test.gguf https://registry.ollama.ai/v2/library/<model>/blobs/sha256:<digest>`
