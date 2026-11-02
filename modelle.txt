@@ -1,0 +1,4 @@
+# Modellliste für ollama_pull_retry.py
+# Aufruf: python ollama_pull_retry.py -f modelle.txt
+qwen3-coder:30b
+embeddinggemma:300m
