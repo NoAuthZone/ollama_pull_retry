@@ -23,6 +23,7 @@ Beispiele:
 """
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -44,6 +46,180 @@ FATAL_HINTS = (
     "pull model manifest: 404",
     "does not exist",
 )
+
+
+CERT_ERRORS = []
+TLS_CTX = None  # gesetzt durch configure_tls()
+
+
+PROBE_URL = "https://registry.ollama.ai/v2/"
+SYSTEM_CA_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",                 # Debian/Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",                   # RHEL/Fedora
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # RHEL/Fedora
+    "/etc/ssl/ca-bundle.pem",                             # openSUSE
+    "/etc/ssl/cert.pem",                                  # Alpine/macOS/BSD
+    "/opt/homebrew/etc/ca-certificates/cert.pem",         # Homebrew (Apple Silicon)
+    "/usr/local/etc/openssl/cert.pem",                    # Homebrew (Intel)
+)
+
+
+def _tls_check(ctx, url: str) -> str:
+    """'ok' (Verbindung + Zertifikat in Ordnung), 'cert' (Zertifikatsfehler) oder 'net' (sonstiger Fehler)."""
+    opener = (urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+              if ctx else urllib.request.build_opener())
+    try:
+        opener.open(urllib.request.Request(url), timeout=15).close()
+        return "ok"
+    except urllib.error.HTTPError:
+        return "ok"  # Server antwortet -> TLS hat funktioniert
+    except Exception as e:
+        return "cert" if is_cert_error(e) else "net"
+
+
+def _ctx_from_file(path: str):
+    try:
+        return ssl.create_default_context(cafile=path)
+    except (OSError, ssl.SSLError):
+        return None
+
+
+def _ctx_macos_keychain():
+    """Zertifikate aus den macOS-Schluesselbunden exportieren (wie sie auch Browser/Go nutzen)."""
+    if sys.platform != "darwin" or not shutil.which("security"):
+        return None
+    keychains = ["/System/Library/Keychains/SystemRootCertificates.keychain",
+                 "/Library/Keychains/System.keychain",
+                 os.path.expanduser("~/Library/Keychains/login.keychain-db")]
+    pem = ""
+    for kc in keychains:
+        if os.path.exists(kc):
+            try:
+                pem += subprocess.run(["security", "find-certificate", "-a", "-p", kc],
+                                      capture_output=True, text=True, timeout=30).stdout
+            except Exception:
+                pass
+    if "BEGIN CERTIFICATE" not in pem:
+        return None
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+    tmp.write(pem)
+    tmp.close()
+    atexit.register(lambda: os.path.exists(tmp.name) and os.remove(tmp.name))
+    return _ctx_from_file(tmp.name)
+
+
+def _ctx_windows_store():
+    if not hasattr(ssl, "enum_certificates"):
+        return None
+    ctx = ssl.create_default_context()
+    for store in ("ROOT", "CA"):
+        try:
+            for cert, enc, _trust in ssl.enum_certificates(store):
+                if enc == "x509_asn":
+                    try:
+                        ctx.load_verify_locations(cadata=cert)
+                    except ssl.SSLError:
+                        pass
+        except OSError:
+            pass
+    return ctx
+
+
+def configure_tls(ca_bundle=None, insecure=False, strict=False, probe_url=PROBE_URL) -> bool:
+    """TLS-Vertrauen einrichten, ohne dass der Nutzer etwas vorbereiten muss.
+
+    Reihenfolge: eigenes CA-Bundle -> Python-Standard (+ truststore, falls installiert) -> System-CA-Dateien
+    -> macOS-Schluesselbund -> Windows-Zertifikatsspeicher -> (nur ohne --strict) ungeprueft mit Warnung.
+    Gibt False zurueck, wenn keine funktionierende Variante gefunden wurde.
+    """
+    global TLS_CTX
+
+    def use(ctx, label):
+        global TLS_CTX
+        TLS_CTX = ctx
+        if ctx:
+            urllib.request.install_opener(
+                urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx)))
+        print(f"TLS: {label}")
+        return True
+
+    def unverified():
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    if insecure:
+        print("WARNUNG: --insecure - TLS-Zertifikate werden NICHT geprueft. Integritaet sichern nur die "
+              "SHA256-Pruefung der Blobs und der anschliessende 'ollama pull' (Manifest ueber Ollamas eigene "
+              "TLS-Verbindung).")
+        return use(unverified(), "ungeprueft (--insecure)")
+
+    if ca_bundle:
+        ctx = _ctx_from_file(ca_bundle)
+        if not ctx:
+            print(f"FEHLER: CA-Bundle nicht lesbar: {ca_bundle}")
+            return False
+        return use(ctx, f"CA-Bundle {ca_bundle}")
+
+    try:  # optional: pip install truststore (Python 3.10+) -> OS-Zertifikatsspeicher
+        import truststore
+        truststore.inject_into_ssl()
+    except Exception:
+        pass
+
+    candidates = [("Python-Standard", lambda: None)]
+    for f in SYSTEM_CA_FILES:
+        if os.path.isfile(f):
+            candidates.append((f"System-CA-Datei {f}", lambda f=f: _ctx_from_file(f)))
+    candidates.append(("macOS-Schluesselbund", _ctx_macos_keychain))
+    candidates.append(("Windows-Zertifikatsspeicher", _ctx_windows_store))
+
+    saw_cert_error = False
+    for label, make in candidates:
+        ctx = make()
+        if ctx is None and label != "Python-Standard":
+            continue
+        result = _tls_check(ctx, probe_url)
+        if result == "ok":
+            return use(ctx, label)
+        if result == "net":
+            # Kein Zertifikatsproblem (offline, Firewall ...): hier hilft kein anderes Vertrauen.
+            if not saw_cert_error:
+                return True
+            break
+        saw_cert_error = True
+
+    if strict:
+        print("TLS: kein vertrauenswuerdiges Zertifikat gefunden (--strict, kein Fallback).")
+        return False
+    print("WARNUNG: Zertifikat der Registry wird auf diesem System von keinem Zertifikatsspeicher akzeptiert "
+          "(vermutlich TLS-Inspektion). Fahre OHNE Zertifikatspruefung fort. Integritaet sichern die "
+          "SHA256-Pruefung der Blobs und der anschliessende 'ollama pull'. Mit --strict abschalten, "
+          "oder --ca-bundle bzw. 'pip install truststore' nutzen.")
+    return use(unverified(), "ungeprueft (automatischer Fallback)")
+
+
+def is_cert_error(e: BaseException) -> bool:
+    reason = getattr(e, "reason", None)
+    return (isinstance(e, ssl.SSLCertVerificationError)
+            or isinstance(reason, ssl.SSLCertVerificationError)
+            or "CERTIFICATE_VERIFY_FAILED" in str(e)
+            or "local issuer certificate" in str(e))
+
+
+def cert_hint() -> None:
+    print(
+        "\nTLS-Zertifikatsfehler ('unable to get local issuer certificate'). Kein Retry sinnvoll. Typische Ursachen:\n"
+        "  1. Firmen-/Proxy-Inspektion mit eigener CA: CA als PEM exportieren und\n"
+        "     '--ca-bundle firmen-ca.pem' (oder SSL_CERT_FILE) setzen - oder 'pip install truststore'\n"
+        "     (nutzt dann den System-Zertifikatsspeicher von Windows/macOS/Linux).\n"
+        "  2. macOS mit python.org-Python: '/Applications/Python 3.x/Install Certificates.command' ausfuehren.\n"
+        "  3. Linux: Paket 'ca-certificates' installieren/aktualisieren.\n"
+        "  4. Ohne --strict faellt das Skript im Direkt-/Diagnosemodus selbst auf ungeprueft zurueck.\n"
+        "Hinweis: Betrifft der Fehler 'ollama pull' selbst (Go: 'x509: certificate signed by unknown\n"
+        "authority'), braucht der Ollama-SERVER die CA: --server-env SSL_CERT_FILE=/pfad/ca.pem (eigener Server)\n"
+        "bzw. die CA im System-Speicher des Servers.")
 
 
 class Stalled(Exception):
@@ -95,7 +271,7 @@ def doh_lookup(url: str, name: str):
 def probe_ip(ip: str, hostname: str, timeout: int = 8):
     """TCP+TLS+HTTP-Test gegen eine IP (SNI/Host = hostname)."""
     t0 = time.time()
-    ctx = ssl.create_default_context()
+    ctx = TLS_CTX or ssl.create_default_context()
     with socket.create_connection((ip, 443), timeout=timeout) as s:
         t_conn = time.time() - t0
         with ctx.wrap_socket(s, server_hostname=hostname) as ss:
@@ -135,6 +311,8 @@ def diagnose_host(hostname: str) -> bool:
             print(f"{ip:<18}{', '.join(src):<34}{tc*1000:>6.0f}ms{tt*1000:>7.0f}ms  {first}")
         except Exception as e:
             print(f"{ip:<18}{', '.join(src):<34}{'-':>8}{'-':>9}  FEHLER: {e}")
+            if is_cert_error(e):
+                CERT_ERRORS.append(hostname)
 
     if not results:
         print("Keine IP erreichbar. Pruefe Firewall/Proxy/VPN (ISP-Sperre moeglich).\n")
@@ -164,6 +342,8 @@ def diagnose() -> int:
         "Zusatztest (wie von rick-github vorgeschlagen), Geschwindigkeit pruefen:\n"
         "  curl -L -C - -o test.gguf https://registry.ollama.ai/v2/library/<modell>/blobs/sha256:<digest>"
     )
+    if CERT_ERRORS:
+        cert_hint()
     return 0 if (ok_reg and ok_cdn) else 1
 
 
@@ -469,6 +649,9 @@ def download_blob(url: str, digest: str, size: int, blobs_dir: str,
             else:
                 reason = f"HTTP {e.code} {e.reason}"
         except OSError as e:
+            if is_cert_error(e):
+                cert_hint()
+                return False
             if isinstance(e, (PermissionError,)) or getattr(e, "errno", None) in (13, 28, 30):
                 print(f"\nFEHLER (Schreibrechte/Platz?): {e}")
                 return False
@@ -518,6 +701,8 @@ def direct_download(model: str, models_dir: str, stall_timeout: int,
         manifest = fetch_manifest(host, ns, name, tag)
     except Exception as e:
         print(f"FEHLER beim Manifest ({e})")
+        if is_cert_error(e):
+            cert_hint()
         return False
 
     layers = [manifest["config"]] + manifest.get("layers", [])
@@ -556,6 +741,14 @@ def main() -> int:
                     help="DNS/Erreichbarkeit von registry.ollama.ai pruefen (System-DNS vs. DoH) und beenden")
     ap.add_argument("--proxy", metavar="URL",
                     help="Eigenen 'ollama serve' mit diesem HTTP(S)-Proxy starten (z. B. http://127.0.0.1:8080)")
+    ap.add_argument("--ca-bundle", metavar="PEM",
+                    help="Eigenes CA-Bundle (PEM) fuer HTTPS zur Registry, z. B. Firmen-CA bei TLS-Inspektion "
+                         "(--direct/--diagnose). Alternativ: SSL_CERT_FILE oder 'pip install truststore'")
+    ap.add_argument("--strict", action="store_true",
+                    help="Kein automatischer Fallback auf ungepruefte TLS-Verbindungen (--direct/--diagnose)")
+    ap.add_argument("--insecure", action="store_true",
+                    help="TLS-Zertifikate nicht pruefen (nur --direct/--diagnose). Blobs werden weiterhin per SHA256 "
+                         "geprueft; 'ollama pull' holt das Manifest danach ueber Ollamas eigene Verbindung")
     ap.add_argument("--direct", action="store_true",
                     help="Blobs selbst laden (Resume + SHA256) und danach per 'ollama pull' registrieren. "
                          "Nur lokal, nur registry.ollama.ai")
@@ -573,6 +766,10 @@ def main() -> int:
                     help="Max. Wartezeit zwischen Versuchen in Sekunden (Standard: 60)")
     args = ap.parse_args()
 
+    if args.direct or args.diagnose or args.ca_bundle or args.insecure:
+        if not configure_tls(args.ca_bundle or os.environ.get("SSL_CERT_FILE"), args.insecure, args.strict):
+            cert_hint()
+            return 1
     if args.diagnose:
         return diagnose()
 
